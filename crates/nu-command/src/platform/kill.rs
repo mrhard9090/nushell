@@ -126,12 +126,12 @@ impl Command for Kill {
         if !quiet && !output.status.success() {
             return Err(ShellError::Generic(GenericError::new(
                 "process didn't terminate successfully",
-                String::from_utf8(output.stderr).unwrap_or_default(),
+                decode_output(output.stderr).unwrap_or_default(),
                 call.head,
             )));
         }
 
-        let mut output = String::from_utf8(output.stdout).map_err(|e| {
+        let mut output = decode_output(output.stdout).map_err(|e| {
             ShellError::Generic(GenericError::new(
                 "failed to convert output to string",
                 e.to_string(),
@@ -170,6 +170,44 @@ impl Command for Kill {
     }
 }
 
+#[cfg(not(windows))]
+fn decode_output(bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+    String::from_utf8(bytes)
+}
+
+/// Decodes the output of `taskkill`, which is written in the console output
+/// code page rather than UTF-8 (e.g. code page 932 on Japanese Windows).
+#[cfg(windows)]
+fn decode_output(bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+    use windows::Win32::{Globalization::CP_OEMCP, System::Console::GetConsoleOutputCP};
+
+    String::from_utf8(bytes).or_else(|err| {
+        // SAFETY: `GetConsoleOutputCP` has no preconditions. It returns 0 when
+        // there is no console, in which case the OEM code page is used.
+        let code_page = match unsafe { GetConsoleOutputCP() } {
+            0 => CP_OEMCP,
+            code_page => code_page,
+        };
+        Ok(decode_code_page(err.as_bytes(), code_page))
+    })
+}
+
+#[cfg(windows)]
+fn decode_code_page(bytes: &[u8], code_page: u32) -> String {
+    use windows::Win32::Globalization::{MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar};
+
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    // SAFETY: both calls only read `bytes` and write within `wide`; the first
+    // call only computes the required length.
+    let len = unsafe { MultiByteToWideChar(code_page, flags, bytes, None) };
+    let mut wide = vec![0; usize::try_from(len).unwrap_or_default()];
+    let len = unsafe { MultiByteToWideChar(code_page, flags, bytes, Some(&mut wide)) };
+    match usize::try_from(len) {
+        Ok(len) if len > 0 => String::from_utf16_lossy(&wide[..len]),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 fn inferred_signal_number(raw: &[u8], pid: i64) -> Option<u64> {
     if pid < 0 {
         return Some(pid.unsigned_abs());
@@ -191,6 +229,14 @@ mod tests {
     #[test]
     fn examples_work_as_expected() -> nu_test_support::Result {
         nu_test_support::test().examples(Kill)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decode_code_page_reads_non_utf8_console_output() {
+        // "成功" (success) as taskkill prints it on Japanese Windows (CP 932).
+        let shift_jis = [0x90, 0xac, 0x8c, 0xf7];
+        assert_eq!(decode_code_page(&shift_jis, 932), "成功");
     }
 
     #[test]
